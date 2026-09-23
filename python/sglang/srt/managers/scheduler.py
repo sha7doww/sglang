@@ -1720,6 +1720,7 @@ class Scheduler(
         minimum_chunk = self.truncation_align_size
         if not _use_exact_chunk_fill():
             minimum_chunk = math.lcm(minimum_chunk, self.page_size)
+        self.min_chunked_prefill_size = minimum_chunk
         if (
             self.chunked_prefill_size is not None
             and self.chunked_prefill_size < minimum_chunk
@@ -3907,6 +3908,11 @@ class Scheduler(
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
+                if self.align_chunked_prefill:
+                    # A latency prediction below the legal alignment would
+                    # park this continuation forever at the same history.
+                    # Memory admission still caps the resulting proposal.
+                    dynamic_size = max(dynamic_size, self.min_chunked_prefill_size)
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy

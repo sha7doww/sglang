@@ -128,7 +128,7 @@ class TestDeterministicGDNPrefill(unittest.TestCase):
         linear.deterministic_prefill_chunk_alignment = None
         self.assertIsNone(split.deterministic_prefill_chunk_alignment)
 
-    def test_parked_continuation_is_not_counted_in_another_requests_batch(self):
+    def parked_continuation_scheduler(self):
         scheduler = MagicMock(spec=Scheduler)
         for name in (
             "enable_priority_preemption",
@@ -184,6 +184,10 @@ class TestDeterministicGDNPrefill(unittest.TestCase):
         )
         adder.add_chunked_req.return_value = parked
         adder.add_one_req.return_value = AddReqResult.CONTINUE
+        return scheduler, parked, running, adder
+
+    def test_parked_continuation_is_not_counted_in_another_requests_batch(self):
+        scheduler, parked, running, adder = self.parked_continuation_scheduler()
         with (
             get_context().override_server_args(),
             patch("sglang.srt.managers.scheduler.PrefillAdder", return_value=adder),
@@ -198,6 +202,24 @@ class TestDeterministicGDNPrefill(unittest.TestCase):
         scheduler.load_inquirer._get_num_pending_tokens.assert_called_once_with(
             chunk_deduct=0
         )
+
+    def test_dynamic_prediction_cannot_permanently_park_a_continuation(self):
+        scheduler, _, running, adder = self.parked_continuation_scheduler()
+        scheduler.chunked_prefill_size = 8192
+        scheduler.truncation_align_size = 4096
+        scheduler.min_chunked_prefill_size = 4096
+        scheduler.dynamic_chunk_sizer = MagicMock()
+        scheduler.dynamic_chunk_sizer.predict.return_value = 2048
+        with (
+            get_context().override_server_args(),
+            patch(
+                "sglang.srt.managers.scheduler.PrefillAdder", return_value=adder
+            ) as factory,
+            patch("sglang.srt.managers.scheduler.ScheduleBatch.init_new"),
+            patch("sglang.srt.managers.scheduler.PrefillStats.from_adder"),
+        ):
+            Scheduler._get_new_batch_prefill_raw(scheduler, None, running)
+        self.assertEqual(factory.call_args.args[6], 4096)
 
 
 if __name__ == "__main__":

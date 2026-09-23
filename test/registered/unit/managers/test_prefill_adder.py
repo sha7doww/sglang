@@ -1237,6 +1237,7 @@ class TestPrefillAdder(CustomTestCase):
     def _create_delayer_req(self, num_tokens: int):
         req = self.create_mock_req("delayer_req", priority=0, max_new_tokens=8)
         req.full_untruncated_fill_ids = list(range(num_tokens))
+        req.origin_input_ids = list(range(num_tokens))
         req.host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
