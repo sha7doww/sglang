@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from array import array
 
 from sglang.srt.environ import envs
@@ -636,6 +637,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        align_chunked_prefill: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -648,6 +650,7 @@ class PrefillAdder:
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
         self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
+        self.align_chunked_prefill = align_chunked_prefill and dllm_config is None
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -1057,7 +1060,24 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def _align_intermediate_chunk(
+        self, prefix_len: int, limit: int, alignment: int
+    ) -> int:
+        if self.exact_chunk_fill:
+            return limit // alignment * alignment
+        # Usually the prefix is page-aligned. Preserve both constraints rather
+        # than letting a subsequent page-end rounding undo kernel alignment.
+        if prefix_len % self.page_size == 0:
+            step = math.lcm(alignment, self.page_size)
+            return limit // step * step
+        if prefix_len % math.gcd(alignment, self.page_size):
+            return 0
+        length = limit // alignment * alignment
+        while length > 0 and (prefix_len + length) % self.page_size:
+            length -= alignment
+        return max(length, 0)
+
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1069,7 +1089,10 @@ class PrefillAdder:
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
-        if self.prefill_delayer_single_pass is not None:
+        if (
+            self.prefill_delayer_single_pass is not None
+            and not self.align_chunked_prefill
+        ):
             self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
                 running_batch=self.running_batch.batch_size(),
@@ -1094,6 +1117,23 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if self.align_chunked_prefill:
+            if truncated:
+                new_len = self._align_intermediate_chunk(
+                    len(req.prefix_indices), new_len, truncation_align_size
+                )
+            if new_len <= 0:
+                # Let another candidate negotiate, or let finalize report a
+                # non-prefillable pass if nothing can run.
+                return req
+            if self.prefill_delayer_single_pass is not None:
+                self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True,
+                    running_batch=self.running_batch.batch_size(),
+                    max_prefill_bs=self.max_prefill_bs,
+                    max_running_requests=self.max_running_requests,
+                    waiting_queue_len=self.waiting_queue_len,
+                )
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1129,7 +1169,12 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(
+        self,
+        req: Req,
+        truncation_align_size: Optional[int] = None,
+        has_chunked_req: bool = False,
+    ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1195,6 +1240,22 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
+        # Establish a legal intermediate chunk before announcing that this
+        # request can prefill. A complete short tail needs no rounding.
+        trunc_len = self.rem_chunk_tokens
+        if (
+            self.align_chunked_prefill
+            and trunc_len is not None
+            and cand_extend_input_len > trunc_len
+        ):
+            if has_chunked_req:
+                return AddReqResult.OTHER
+            trunc_len = self._align_intermediate_chunk(
+                len(req.prefix_indices), trunc_len, truncation_align_size
+            )
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -1245,8 +1306,6 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
-
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
@@ -1274,7 +1333,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(
+                req, truncation_align_size, has_chunked_req
+            )
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1427,13 +1488,17 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and (
+                self.align_chunked_prefill
+                or get_schedule().schedule_policy == "shortest-prefill-first"
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER
-            if self.exact_chunk_fill:
+            if self.align_chunked_prefill:
+                extend_len = self._align_intermediate_chunk(
+                    prefix_len, chunk_tokens_limit, truncation_align_size
+                )
+            elif self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
                 # here, so this never runs past the end of the prompt. Uses the

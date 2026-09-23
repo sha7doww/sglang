@@ -218,6 +218,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    _use_exact_chunk_fill,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1692,6 +1693,7 @@ class Scheduler(
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
+        self.align_chunked_prefill = False
         if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
             return
@@ -1707,6 +1709,25 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        kernel_alignment = self.tp_worker.model_runner.attn_backend.deterministic_prefill_chunk_alignment
+        if kernel_alignment is None or self.dllm_config is not None:
+            return
+
+        self.align_chunked_prefill = True
+        self.truncation_align_size = math.lcm(
+            self.truncation_align_size or 1, kernel_alignment
+        )
+        minimum_chunk = self.truncation_align_size
+        if not _use_exact_chunk_fill():
+            minimum_chunk = math.lcm(minimum_chunk, self.page_size)
+        if (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size < minimum_chunk
+        ):
+            raise ValueError(
+                "Deterministic GDN prefill requires --chunked-prefill-size "
+                f"of at least {minimum_chunk} tokens, or disable chunked prefill."
+            )
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
@@ -3913,6 +3934,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            align_chunked_prefill=self.align_chunked_prefill,
         )
 
         if self.chunked_req is not None:
@@ -3923,7 +3945,9 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, self.truncation_align_size
+            )
 
         if self.enable_lora:
             running_loras = {
@@ -4060,8 +4084,13 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        # A continuation can be parked for insufficient memory/chunk budget
+        # while another request is admitted. Only account for submitted work.
+        batch_chunked_req = (
+            self.chunked_req if self.chunked_req in can_run_set else None
+        )
+        if batch_chunked_req is not None:
+            batch_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4074,11 +4103,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=batch_chunked_req,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            batch_chunked_req is None or len(can_run_list) != 1
         )
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
@@ -4100,8 +4129,8 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
+                    batch_chunked_req.extend_range.length
+                    if batch_chunked_req is not None
                     else 0
                 ),
             ),

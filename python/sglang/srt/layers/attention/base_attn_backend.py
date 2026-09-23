@@ -61,6 +61,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Length alignment for non-final prefill chunks in deterministic mode.
+    # Opt-in backends require it on both initial and continuation chunks.
+    deterministic_prefill_chunk_alignment: Optional[int] = None
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

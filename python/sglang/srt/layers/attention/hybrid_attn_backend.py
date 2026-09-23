@@ -94,6 +94,10 @@ class HybridAttnBackend(AttentionBackend):
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
 
     @property
+    def deterministic_prefill_chunk_alignment(self) -> Optional[int]:
+        return self.prefill_backend.deterministic_prefill_chunk_alignment
+
+    @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
 

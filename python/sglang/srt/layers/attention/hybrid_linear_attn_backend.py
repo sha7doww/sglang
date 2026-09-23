@@ -1190,6 +1190,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def deterministic_prefill_chunk_alignment(self) -> Optional[int]:
+        return self.linear_attn_backend.deterministic_prefill_chunk_alignment
+
+    @property
     def supports_ragged_verify_graph(self) -> bool:
         return (
             self.full_attn_backend.supports_ragged_verify_graph

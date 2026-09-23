@@ -1247,6 +1247,130 @@ class TestPrefillAdder(CustomTestCase):
         )
         return req
 
+    def test_deterministic_gdn_alignment_on_all_admission_paths(self):
+        for path in ("normal", "continuation", "ignore_eos"):
+            for budget, remaining, expected in (
+                (1000, 10000, 960),
+                (2048, 10000, 2048),
+                (63, 31, 31),
+                (31, 31, 31),
+                (20, 31, 0),
+                (63, 10000, 0),
+            ):
+                with self.subTest(path=path, budget=budget, remaining=remaining):
+                    delayer = _RecordingDelayer(allow=True)
+                    adder = self._create_delayer_adder(
+                        available_tokens=100_000,
+                        delayer=delayer,
+                        rem_chunk_tokens=budget,
+                        align_chunked_prefill=True,
+                    )
+                    req = self._create_delayer_req(remaining)
+                    self.mock_tree_cache.disable = path == "ignore_eos"
+                    req.sampling_params.ignore_eos = path == "ignore_eos"
+                    before = (adder.rem_chunk_tokens, adder.memory_budget.total_offset)
+                    if path == "continuation":
+                        adder.add_chunked_req(req, 64)
+                    else:
+                        adder.add_one_req(req, False, 64)
+                    if expected:
+                        self.assertEqual(req.extend_range.length, expected)
+                        self.assertEqual(adder.can_run_list, [req])
+                        self.assertEqual(delayer.calls, [True])
+                    else:
+                        self.assertEqual(adder.can_run_list, [])
+                        req.set_extend_range.assert_not_called()
+                        self.assertEqual(delayer.calls, [])
+                        self.assertEqual(
+                            (adder.rem_chunk_tokens, adder.memory_budget.total_offset),
+                            before,
+                        )
+
+    def test_deterministic_gdn_pages_and_cached_prefix(self):
+        for prefix, host_hit, page, exact, expected in (
+            (4096, 0, 1, False, 960),
+            (4032, 64, 1, False, 960),
+            (4097, 0, 1, False, 960),
+            (4096, 0, 128, False, 896),
+            (4096, 0, 128, True, 960),
+        ):
+            with self.subTest(prefix=prefix, host_hit=host_hit, page=page, exact=exact):
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000,
+                    delayer=None,
+                    page_size=page,
+                    rem_chunk_tokens=1000,
+                    align_chunked_prefill=True,
+                )
+                adder.exact_chunk_fill = exact
+                req = self._create_delayer_req(12000)
+                req.prefix_indices = list(range(prefix))
+                admission = adder._select_prefill_admission(
+                    req,
+                    total_tokens=12008,
+                    host_hit_length=host_hit,
+                    swa_host_hit_length=0,
+                    truncation_align_size=64,
+                )
+                self.assertEqual(admission.prefix_len, prefix + host_hit)
+                self.assertEqual(admission.extend_len, expected)
+
+    def test_deterministic_gdn_continuation_defers_then_finishes(self):
+        req = self._create_delayer_req(4255)
+        req.prefix_indices = list(range(4096))
+        spans = []
+        for budget, expected in ((63, 0), (128, 128), (63, 31)):
+            adder = self._create_delayer_adder(
+                available_tokens=100_000,
+                delayer=None,
+                rem_chunk_tokens=budget,
+                align_chunked_prefill=True,
+            )
+            before = len(req.prefix_indices)
+            result = adder.add_chunked_req(req, 64)
+            if expected:
+                self.assertEqual(req.extend_range, Range(before, before + expected))
+                spans.extend(range(req.extend_range.start, req.extend_range.end))
+                req.prefix_indices = list(range(req.extend_range.end))
+            else:
+                self.assertIs(result, req)
+                self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(result)
+        self.assertEqual(spans, list(range(4096, 4255)))
+
+    def test_deterministic_gdn_continuation_preserves_existing_alignment(self):
+        for enabled, expected in ((False, 5000), (True, 4096)):
+            adder = self._create_delayer_adder(
+                available_tokens=100_000,
+                delayer=None,
+                rem_chunk_tokens=5000,
+                align_chunked_prefill=enabled,
+            )
+            req = self._create_delayer_req(10000)
+            adder.add_chunked_req(req, 4096)
+            self.assertEqual(req.extend_range.length, expected)
+
+    def test_deterministic_gdn_parked_request_keeps_continuation_slot(self):
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                adder = self._create_delayer_adder(
+                    available_tokens=100_000,
+                    delayer=None,
+                    rem_chunk_tokens=1000,
+                    align_chunked_prefill=True,
+                )
+                self.mock_tree_cache.disable = ignore_eos
+                long_req = self._create_delayer_req(2000)
+                long_req.sampling_params.ignore_eos = ignore_eos
+                self.assertEqual(
+                    adder.add_one_req(long_req, True, 64), AddReqResult.OTHER
+                )
+                self.assertIsNone(adder.new_chunked_req)
+                short_req = self._create_delayer_req(31)
+                short_req.sampling_params.ignore_eos = ignore_eos
+                adder.add_one_req(short_req, True, 64)
+                self.assertEqual(adder.can_run_list, [short_req])
+
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
         # the fix would regress non-SWA models.

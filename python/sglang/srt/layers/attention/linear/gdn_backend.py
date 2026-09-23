@@ -535,6 +535,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+        # Use the dispatched implementation: CuTe DSL prefill can fall back to
+        # Triton on Hopper. CPU/NPU use different chunk kernels.
+        if (
+            not is_cpu()
+            and not is_npu()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+        ):
+            self.deterministic_prefill_chunk_alignment = FLA_CHUNK_SIZE
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
